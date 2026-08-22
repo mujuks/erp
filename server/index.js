@@ -3,7 +3,7 @@ import cors from 'cors';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { db, PNL_SQL } from './db.js';
+import { db, all, get, PNL_SQL } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -71,293 +71,346 @@ function validateTrade(body) {
   };
 }
 
-app.get('/api/accounts', (_req, res) => {
-  const rows = db
-    .prepare(
+app.get('/api/accounts', async (_req, res) => {
+  try {
+    const rows = await all(
       `SELECT a.id, a.name, a.broker, a.starting_balance, a.currency, a.created_at,
         COALESCE(SUM(CASE WHEN t.status = 'closed' THEN ${PNL_SQL} END), 0) AS realized_pnl,
         COUNT(t.id) AS trade_count
        FROM accounts a LEFT JOIN trades t ON t.account_id = a.id
        GROUP BY a.id ORDER BY a.id`
-    )
-    .all();
-  res.json(
-    rows.map((r) => ({ ...r, balance: r.starting_balance + r.realized_pnl }))
-  );
-});
-
-app.post('/api/accounts', (req, res) => {
-  const name = String(req.body.name || '').trim();
-  const broker = String(req.body.broker || '').trim();
-  const startingBalance = num(req.body.starting_balance);
-  if (!name) return res.status(400).json({ error: 'Account name is required' });
-  const balance = startingBalance === null || Number.isNaN(startingBalance) ? 0 : startingBalance;
-  const result = db
-    .prepare('INSERT INTO accounts (name, broker, starting_balance) VALUES (?, ?, ?)')
-    .run(name, broker, balance);
-  res.status(201).json({ id: Number(result.lastInsertRowid) });
-});
-
-app.delete('/api/accounts/:id', (req, res) => {
-  const id = Number(req.params.id);
-  const used = db.prepare('SELECT COUNT(*) AS c FROM trades WHERE account_id = ?').get(id).c;
-  if (used > 0)
-    return res.status(400).json({ error: 'Cannot delete an account that has trades' });
-  const result = db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
-  if (result.changes === 0) return res.status(404).json({ error: 'Account not found' });
-  res.status(204).end();
-});
-
-app.get('/api/trades', (req, res) => {
-  const clauses = [];
-  const params = [];
-  if (req.query.status) {
-    clauses.push('t.status = ?');
-    params.push(req.query.status);
-  }
-  if (req.query.account_id) {
-    clauses.push('t.account_id = ?');
-    params.push(Number(req.query.account_id));
-  }
-  if (req.query.symbol) {
-    clauses.push('t.symbol LIKE ?');
-    params.push(`%${String(req.query.symbol).toUpperCase()}%`);
-  }
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-  const rows = db
-    .prepare(`${TRADE_SELECT} ${where} ORDER BY t.entry_date DESC, t.id DESC`)
-    .all(...params);
-  res.json(rows);
-});
-
-app.post('/api/trades', (req, res) => {
-  const { errors, values } = validateTrade(req.body);
-  if (errors.length) return res.status(400).json({ error: errors.join('; ') });
-  const result = db
-    .prepare(
-      `INSERT INTO trades
-        (account_id, symbol, direction, status, entry_date, exit_date, entry_price,
-         exit_price, quantity, stop_loss, take_profit, fees, strategy, notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      values.account_id,
-      values.symbol,
-      values.direction,
-      values.status,
-      values.entry_date,
-      values.exit_date,
-      values.entry_price,
-      values.exit_price,
-      values.quantity,
-      values.stop_loss,
-      values.take_profit,
-      values.fees,
-      values.strategy,
-      values.notes
     );
-  const created = db.prepare(`${TRADE_SELECT} WHERE t.id = ?`).get(result.lastInsertRowid);
-  res.status(201).json(created);
-});
-
-app.put('/api/trades/:id', (req, res) => {
-  const id = Number(req.params.id);
-  const existing = db.prepare('SELECT id FROM trades WHERE id = ?').get(id);
-  if (!existing) return res.status(404).json({ error: 'Trade not found' });
-  const { errors, values } = validateTrade(req.body);
-  if (errors.length) return res.status(400).json({ error: errors.join('; ') });
-  db.prepare(
-    `UPDATE trades SET
-      account_id = ?, symbol = ?, direction = ?, status = ?, entry_date = ?, exit_date = ?,
-      entry_price = ?, exit_price = ?, quantity = ?, stop_loss = ?, take_profit = ?,
-      fees = ?, strategy = ?, notes = ?
-     WHERE id = ?`
-  ).run(
-    values.account_id,
-    values.symbol,
-    values.direction,
-    values.status,
-    values.entry_date,
-    values.exit_date,
-    values.entry_price,
-    values.exit_price,
-    values.quantity,
-    values.stop_loss,
-    values.take_profit,
-    values.fees,
-    values.strategy,
-    values.notes,
-    id
-  );
-  const updated = db.prepare(`${TRADE_SELECT} WHERE t.id = ?`).get(id);
-  res.json(updated);
-});
-
-app.delete('/api/trades/:id', (req, res) => {
-  const result = db.prepare('DELETE FROM trades WHERE id = ?').run(Number(req.params.id));
-  if (result.changes === 0) return res.status(404).json({ error: 'Trade not found' });
-  res.status(204).end();
-});
-
-app.get('/api/stats', (req, res) => {
-  let where = '';
-  const params = [];
-  const accId = req.query.account_id;
-  if (accId && accId !== 'all') {
-    where = ' AND t.account_id = ?';
-    params.push(Number(accId));
+    res.json(rows.map((r) => ({ ...r, balance: r.starting_balance + r.realized_pnl })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  const all = db
-    .prepare(`SELECT t.*, ${PNL_SQL} AS pnl FROM trades t WHERE 1=1 ${where}`)
-    .all(...params);
+});
 
-  const closed = all.filter((t) => t.status === 'closed' && t.pnl !== null);
-  const open = all.filter((t) => t.status !== 'closed');
+app.post('/api/accounts', async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim();
+    const broker = String(req.body.broker || '').trim();
+    const startingBalance = num(req.body.starting_balance);
+    if (!name) return res.status(400).json({ error: 'Account name is required' });
+    const balance =
+      startingBalance === null || Number.isNaN(startingBalance) ? 0 : startingBalance;
+    const result = await db.execute({
+      sql: 'INSERT INTO accounts (name, broker, starting_balance) VALUES (?, ?, ?)',
+      args: [name, broker, balance]
+    });
+    res.status(201).json({ id: Number(result.lastInsertRowid) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-  const wins = closed.filter((t) => t.pnl > 0);
-  const losses = closed.filter((t) => t.pnl < 0);
-  const netPnl = closed.reduce((s, t) => s + t.pnl, 0);
-  const grossProfit = wins.reduce((s, t) => s + t.pnl, 0);
-  const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
-  const avgWin = wins.length ? grossProfit / wins.length : 0;
-  const avgLoss = losses.length ? grossLoss / losses.length : 0;
-  const decided = wins.length + losses.length;
+app.delete('/api/accounts/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const used = Number(
+      (await get('SELECT COUNT(*) AS c FROM trades WHERE account_id = ?', [id])).c
+    );
+    if (used > 0)
+      return res.status(400).json({ error: 'Cannot delete an account that has trades' });
+    const result = await db.execute({ sql: 'DELETE FROM accounts WHERE id = ?', args: [id] });
+    if (result.rowsAffected === 0)
+      return res.status(404).json({ error: 'Account not found' });
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-  const summary = {
-    total_trades: all.length,
-    closed_trades: closed.length,
-    open_trades: open.length,
-    wins: wins.length,
-    losses: losses.length,
-    win_rate: decided ? (wins.length / decided) * 100 : 0,
-    net_pnl: netPnl,
-    gross_profit: grossProfit,
-    gross_loss: grossLoss,
-    profit_factor: grossLoss > 0 ? grossProfit / grossLoss : null,
-    avg_win: avgWin,
-    avg_loss: avgLoss,
-    expectancy: closed.length ? netPnl / closed.length : 0,
-    biggest_win: wins.length ? Math.max(...wins.map((t) => t.pnl)) : 0,
-    biggest_loss: losses.length ? Math.min(...losses.map((t) => t.pnl)) : 0
-  };
-
-  const sortedClosed = [...closed].sort((a, b) => {
-    const da = a.exit_date || a.entry_date;
-    const dbb = b.exit_date || b.entry_date;
-    return da < dbb ? -1 : da > dbb ? 1 : a.id - b.id;
-  });
-  let cum = 0;
-  const equityCurve = sortedClosed.map((t) => {
-    cum += t.pnl;
-    return { date: t.exit_date || t.entry_date, pnl: t.pnl, equity: cum };
-  });
-
-  const groupBy = (list, keyFn) => {
-    const map = new Map();
-    for (const t of list) {
-      const key = keyFn(t);
-      if (!map.has(key)) map.set(key, []);
-      map.get(key).push(t);
+app.get('/api/trades', async (req, res) => {
+  try {
+    const clauses = [];
+    const params = [];
+    if (req.query.status) {
+      clauses.push('t.status = ?');
+      params.push(req.query.status);
     }
-    return map;
-  };
+    if (req.query.account_id) {
+      clauses.push('t.account_id = ?');
+      params.push(Number(req.query.account_id));
+    }
+    if (req.query.symbol) {
+      clauses.push('t.symbol LIKE ?');
+      params.push(`%${String(req.query.symbol).toUpperCase()}%`);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = await all(
+      `${TRADE_SELECT} ${where} ORDER BY t.entry_date DESC, t.id DESC`,
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-  const buildStats = (map) =>
-    [...map.entries()].map(([key, list]) => {
+app.get('/api/trades/:id', async (req, res) => {
+  try {
+    const row = await get(`${TRADE_SELECT} WHERE t.id = ?`, [Number(req.params.id)]);
+    if (!row) return res.status(404).json({ error: 'Trade not found' });
+    res.json(row);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const TRADE_INSERT = `INSERT INTO trades
+  (account_id, symbol, direction, status, entry_date, exit_date, entry_price,
+   exit_price, quantity, stop_loss, take_profit, fees, strategy, notes)
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+function tradeArgs(v) {
+  return [
+    v.account_id,
+    v.symbol,
+    v.direction,
+    v.status,
+    v.entry_date,
+    v.exit_date,
+    v.entry_price,
+    v.exit_price,
+    v.quantity,
+    v.stop_loss,
+    v.take_profit,
+    v.fees,
+    v.strategy,
+    v.notes
+  ];
+}
+
+app.post('/api/trades', async (req, res) => {
+  try {
+    const { errors, values } = validateTrade(req.body);
+    if (errors.length) return res.status(400).json({ error: errors.join('; ') });
+    const result = await db.execute({ sql: TRADE_INSERT, args: tradeArgs(values) });
+    const created = await get(`${TRADE_SELECT} WHERE t.id = ?`, [
+      Number(result.lastInsertRowid)
+    ]);
+    res.status(201).json(created);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/trades/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const existing = await get('SELECT id FROM trades WHERE id = ?', [id]);
+    if (!existing) return res.status(404).json({ error: 'Trade not found' });
+    const { errors, values } = validateTrade(req.body);
+    if (errors.length) return res.status(400).json({ error: errors.join('; ') });
+    await db.execute({
+      sql: `UPDATE trades SET
+        account_id = ?, symbol = ?, direction = ?, status = ?, entry_date = ?, exit_date = ?,
+        entry_price = ?, exit_price = ?, quantity = ?, stop_loss = ?, take_profit = ?,
+        fees = ?, strategy = ?, notes = ?
+       WHERE id = ?`,
+      args: [...tradeArgs(values), id]
+    });
+    res.json(await get(`${TRADE_SELECT} WHERE t.id = ?`, [id]));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/trades/:id', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: 'DELETE FROM trades WHERE id = ?',
+      args: [Number(req.params.id)]
+    });
+    if (result.rowsAffected === 0)
+      return res.status(404).json({ error: 'Trade not found' });
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/stats', async (req, res) => {
+  try {
+    let where = '';
+    const params = [];
+    const accId = req.query.account_id;
+    if (accId && accId !== 'all') {
+      where = ' AND t.account_id = ?';
+      params.push(Number(accId));
+    }
+    const allTrades = await all(
+      `SELECT t.*, ${PNL_SQL} AS pnl FROM trades t WHERE 1=1 ${where}`,
+      params
+    );
+
+    const closed = allTrades.filter((t) => t.status === 'closed' && t.pnl !== null);
+    const open = allTrades.filter((t) => t.status !== 'closed');
+
+    const wins = closed.filter((t) => t.pnl > 0);
+    const losses = closed.filter((t) => t.pnl < 0);
+    const netPnl = closed.reduce((s, t) => s + t.pnl, 0);
+    const grossProfit = wins.reduce((s, t) => s + t.pnl, 0);
+    const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
+    const decided = wins.length + losses.length;
+
+    const summary = {
+      total_trades: allTrades.length,
+      closed_trades: closed.length,
+      open_trades: open.length,
+      wins: wins.length,
+      losses: losses.length,
+      win_rate: decided ? (wins.length / decided) * 100 : 0,
+      net_pnl: netPnl,
+      gross_profit: grossProfit,
+      gross_loss: grossLoss,
+      profit_factor: grossLoss > 0 ? grossProfit / grossLoss : null,
+      avg_win: wins.length ? grossProfit / wins.length : 0,
+      avg_loss: losses.length ? grossLoss / losses.length : 0,
+      expectancy: closed.length ? netPnl / closed.length : 0,
+      biggest_win: wins.length ? Math.max(...wins.map((t) => t.pnl)) : 0,
+      biggest_loss: losses.length ? Math.min(...losses.map((t) => t.pnl)) : 0
+    };
+
+    const sortedClosed = [...closed].sort((a, b) => {
+      const da = a.exit_date || a.entry_date;
+      const dbb = b.exit_date || b.entry_date;
+      return da < dbb ? -1 : da > dbb ? 1 : a.id - b.id;
+    });
+    let cum = 0;
+    const equityCurve = sortedClosed.map((t) => {
+      cum += t.pnl;
+      return { date: t.exit_date || t.entry_date, pnl: t.pnl, equity: cum };
+    });
+
+    const groupBy = (list, keyFn) => {
+      const map = new Map();
+      for (const t of list) {
+        const key = keyFn(t);
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(t);
+      }
+      return map;
+    };
+
+    const buildStats = (map) =>
+      [...map.entries()].map(([key, list]) => {
+        const w = list.filter((t) => t.pnl > 0).length;
+        const l = list.filter((t) => t.pnl < 0).length;
+        return {
+          key,
+          trades: list.length,
+          wins: w,
+          losses: l,
+          win_rate: w + l ? (w / (w + l)) * 100 : 0,
+          net_pnl: list.reduce((s, t) => s + t.pnl, 0)
+        };
+      });
+
+    const monthly = buildStats(
+      groupBy(sortedClosed, (t) => (t.exit_date || t.entry_date).slice(0, 7))
+    );
+    const bySymbol = buildStats(groupBy(closed, (t) => t.symbol));
+    const byStrategy = buildStats(
+      groupBy(closed.filter((t) => t.strategy), (t) => t.strategy)
+    );
+    const weekdayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const byWeekday = buildStats(
+      groupBy(closed, (t) =>
+        weekdayNames[new Date(`${t.exit_date || t.entry_date}T00:00:00`).getDay()]
+      )
+    );
+    const byDirection = ['long', 'short'].map((dir) => {
+      const list = closed.filter((t) => t.direction === dir);
       const w = list.filter((t) => t.pnl > 0).length;
-      const l = list.filter((t) => t.pnl < 0).length;
       return {
-        key,
+        key: dir,
         trades: list.length,
         wins: w,
-        losses: l,
-        win_rate: w + l ? (w / (w + l)) * 100 : 0,
+        losses: list.length - w,
+        win_rate: list.length ? (w / list.length) * 100 : 0,
         net_pnl: list.reduce((s, t) => s + t.pnl, 0)
       };
     });
 
-  const monthly = buildStats(groupBy(sortedClosed, (t) => (t.exit_date || t.entry_date).slice(0, 7)));
-  const bySymbol = buildStats(groupBy(closed, (t) => t.symbol));
-  const byStrategy = buildStats(groupBy(closed.filter((t) => t.strategy), (t) => t.strategy));
-  const weekdayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-  const byWeekday = buildStats(
-    groupBy(closed, (t) => weekdayNames[new Date(`${t.exit_date || t.entry_date}T00:00:00`).getDay()])
-  );
-  const byDirection = ['long', 'short'].map((dir) => {
-    const list = closed.filter((t) => t.direction === dir);
-    const w = list.filter((t) => t.pnl > 0).length;
-    return {
-      key: dir,
-      trades: list.length,
-      wins: w,
-      losses: list.length - w,
-      win_rate: list.length ? (w / list.length) * 100 : 0,
-      net_pnl: list.reduce((s, t) => s + t.pnl, 0)
-    };
-  });
+    const topWins = [...closed].sort((a, b) => b.pnl - a.pnl).slice(0, 5);
+    const topLosses = [...closed].sort((a, b) => a.pnl - b.pnl).slice(0, 5);
+    const recentTrades = [...sortedClosed].reverse().slice(0, 8);
 
-  const topWins = [...closed].sort((a, b) => b.pnl - a.pnl).slice(0, 5);
-  const topLosses = [...closed].sort((a, b) => a.pnl - b.pnl).slice(0, 5);
-  const recentTrades = [...sortedClosed].reverse().slice(0, 8);
-
-  res.json({
-    summary,
-    equity_curve: equityCurve,
-    monthly,
-    by_symbol: bySymbol.sort((a, b) => b.net_pnl - a.net_pnl),
-    by_strategy: byStrategy.sort((a, b) => b.net_pnl - a.net_pnl),
-    by_weekday: byWeekday,
-    by_direction: byDirection,
-    top_wins: topWins,
-    top_losses: topLosses,
-    recent_trades: recentTrades,
-    open_trades: open
-  });
+    res.json({
+      summary,
+      equity_curve: equityCurve,
+      monthly,
+      by_symbol: bySymbol.sort((a, b) => b.net_pnl - a.net_pnl),
+      by_strategy: byStrategy.sort((a, b) => b.net_pnl - a.net_pnl),
+      by_weekday: byWeekday,
+      by_direction: byDirection,
+      top_wins: topWins,
+      top_losses: topLosses,
+      recent_trades: recentTrades,
+      open_trades: open
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get('/api/journal', (_req, res) => {
-  const rows = db
-    .prepare('SELECT * FROM journal_entries ORDER BY date DESC, id DESC')
-    .all();
-  res.json(rows);
+app.get('/api/journal', async (_req, res) => {
+  try {
+    res.json(await all('SELECT * FROM journal_entries ORDER BY date DESC, id DESC'));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/api/journal', (req, res) => {
-  const title = String(req.body.title || '').trim();
-  const date = String(req.body.date || '').trim();
-  if (!title) return res.status(400).json({ error: 'Title is required' });
-  if (!date) return res.status(400).json({ error: 'Date is required' });
-  const result = db
-    .prepare('INSERT INTO journal_entries (date, title, content, mood) VALUES (?, ?, ?, ?)')
-    .run(date, title, String(req.body.content || ''), String(req.body.mood || ''));
-  const created = db
-    .prepare('SELECT * FROM journal_entries WHERE id = ?')
-    .get(result.lastInsertRowid);
-  res.status(201).json(created);
+app.post('/api/journal', async (req, res) => {
+  try {
+    const title = String(req.body.title || '').trim();
+    const date = String(req.body.date || '').trim();
+    if (!title) return res.status(400).json({ error: 'Title is required' });
+    if (!date) return res.status(400).json({ error: 'Date is required' });
+    const result = await db.execute({
+      sql: "INSERT INTO journal_entries (date, title, content, mood) VALUES (?, ?, ?, ?)",
+      args: [date, title, String(req.body.content || ''), String(req.body.mood || '')]
+    });
+    res.status(201).json(await get('SELECT * FROM journal_entries WHERE id = ?', [Number(result.lastInsertRowid)]));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.put('/api/journal/:id', (req, res) => {
-  const id = Number(req.params.id);
-  const existing = db.prepare('SELECT id FROM journal_entries WHERE id = ?').get(id);
-  if (!existing) return res.status(404).json({ error: 'Entry not found' });
-  const title = String(req.body.title || '').trim();
-  const date = String(req.body.date || '').trim();
-  if (!title) return res.status(400).json({ error: 'Title is required' });
-  if (!date) return res.status(400).json({ error: 'Date is required' });
-  db.prepare('UPDATE journal_entries SET date = ?, title = ?, content = ?, mood = ? WHERE id = ?').run(
-    date,
-    title,
-    String(req.body.content || ''),
-    String(req.body.mood || ''),
-    id
-  );
-  res.json(db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(id));
+app.put('/api/journal/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const existing = await get('SELECT id FROM journal_entries WHERE id = ?', [id]);
+    if (!existing) return res.status(404).json({ error: 'Entry not found' });
+    const title = String(req.body.title || '').trim();
+    const date = String(req.body.date || '').trim();
+    if (!title) return res.status(400).json({ error: 'Title is required' });
+    if (!date) return res.status(400).json({ error: 'Date is required' });
+    await db.execute({
+      sql: 'UPDATE journal_entries SET date = ?, title = ?, content = ?, mood = ? WHERE id = ?',
+      args: [date, title, String(req.body.content || ''), String(req.body.mood || ''), id]
+    });
+    res.json(await get('SELECT * FROM journal_entries WHERE id = ?', [id]));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.delete('/api/journal/:id', (req, res) => {
-  const result = db.prepare('DELETE FROM journal_entries WHERE id = ?').run(Number(req.params.id));
-  if (result.changes === 0) return res.status(404).json({ error: 'Entry not found' });
-  res.status(204).end();
+app.delete('/api/journal/:id', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: 'DELETE FROM journal_entries WHERE id = ?',
+      args: [Number(req.params.id)]
+    });
+    if (result.rowsAffected === 0)
+      return res.status(404).json({ error: 'Entry not found' });
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const distDir = path.join(__dirname, '..', 'client', 'dist');
@@ -370,5 +423,9 @@ if (fs.existsSync(distDir)) {
 
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Trading ERP running on http://localhost:${PORT}`));
+export default app;
+
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 3001;
+  app.listen(PORT, () => console.log(`Trading ERP running on http://localhost:${PORT}`));
+}

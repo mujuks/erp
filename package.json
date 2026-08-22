@@ -2,8 +2,12 @@
   "name": "trading-erp",
   "version": "1.0.0",
   "private": true,
+  "workspaces": [
+    "server",
+    "client"
+  ],
   "scripts": {
-    "setup": "npm install && npm install --prefix server && npm install --prefix client",
+    "setup": "npm install",
     "seed": "node server/seed.js",
     "dev": "concurrently -n api,web -c blue,green \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
     "build": "npm run build --prefix client",
